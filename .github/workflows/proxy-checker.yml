@@ -1,135 +1,31 @@
-name: Advanced Proxy Checker
+name: Proxy Checker - Socket Mode
 
 on:
+  workflow_dispatch:
   schedule:
-    # Run every 3 hours (more frequent for better results)
     - cron: '0 */3 * * *'
-  workflow_dispatch:  # Manual trigger
-  
-  # Optional: Run on push to ips.txt
-  push:
-    paths:
-      - 'ips.txt'
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # GitHub max is 360 minutes
     
     steps:
-    - name: Checkout repository
+    - name: Checkout
       uses: actions/checkout@v4
     
-    - name: Install masscan (optimized)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y masscan
-        # Optimize system for high packet rate
-        sudo sysctl -w net.core.rmem_max=2500000
-        sudo sysctl -w net.core.wmem_max=2500000
-        masscan --version
-    
-    - name: Set up Python
+    - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        cache: 'pip'  # Cache dependencies for faster runs
     
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install aiohttp aiohttp-socks
+    - name: Install dependencies
+      run: pip install aiohttp aiohttp-socks
     
-    - name: Verify ips.txt exists
-      run: |
-        if [ ! -f ips.txt ]; then
-          echo "❌ ips.txt not found in repository!"
-          exit 1
-        fi
-        echo "📄 Total IP ranges: $(wc -l < ips.txt)"
-        echo "📊 First 5 ranges:"
-        head -5 ips.txt
+    - name: Run socket-based scanner
+      run: python proxy_checker.py
     
-    - name: Run advanced proxy checker
-      id: scan
-      run: |
-        python proxy_checker.py 2>&1 | tee live_output.log
-      shell: bash
-    
-    - name: Display real-time results
-      if: always()
-      run: |
-        echo "========================================="
-        echo "📡 LIVE SCAN RESULTS:"
-        echo "========================================="
-        cat live_output.log
-        echo "========================================="
-    
-    - name: Generate statistics
-      if: always()
-      run: |
-        echo "## 📊 Proxy Scan Statistics" > summary.md
-        echo "" >> summary.md
-        echo "**Scan Time:** $(date)" >> summary.md
-        echo "**Total Working Proxies:** $(cat result.txt 2>/dev/null | wc -l)" >> summary.md
-        echo "" >> summary.md
-        
-        if [ -f detailed_results.txt ]; then
-          echo "### Protocol Distribution" >> summary.md
-          echo '```' >> summary.md
-          cut -d'|' -f2 detailed_results.txt | sort | uniq -c | sort -rn >> summary.md
-          echo '```' >> summary.md
-          echo "" >> summary.md
-        fi
-        
-        if [ -f result.txt ] && [ $(wc -l < result.txt) -gt 0 ]; then
-          echo "### ✅ Working Proxies (First 50)" >> summary.md
-          echo '```' >> summary.md
-          head -50 result.txt >> summary.md
-          echo '```' >> summary.md
-        else
-          echo "### ⚠️ No working proxies found" >> summary.md
-        fi
-    
-    - name: Commit and push results
-      if: always()
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        
-        # Add all result files
-        git add result.txt detailed_results.txt common_ports.txt live_output.log 2>/dev/null || true
-        
-        # Only commit if there are changes
-        if git diff --staged --quiet; then
-          echo "ℹ️ No changes to commit"
-        else
-          git commit -m "🤖 Auto-update proxies - $(date '+%Y-%m-%d %H:%M:%S')"
-          git push
-          echo "✅ Results pushed to repository"
-        fi
-    
-    - name: Upload artifacts
-      if: always()
+    - name: Upload results
       uses: actions/upload-artifact@v4
       with:
-        name: proxy-scan-full-results
-        path: |
-          result.txt
-          detailed_results.txt
-          common_ports.txt
-          live_output.log
-          summary.md
-        retention-days: 14
-        compression-level: 9
-    
-    - name: Create GitHub summary
-      if: always()
-      run: |
-        cat summary.md >> $GITHUB_STEP_SUMMARY
-    
-    - name: Notify on success (optional)
-      if: success() && github.event_name == 'workflow_dispatch'
-      run: |
-        echo "✅ Proxy scan completed successfully!"
-        echo "📊 Total working proxies: $(cat result.txt 2>/dev/null | wc -l)"
+        name: proxy-results
+        path: result.txt
