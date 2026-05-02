@@ -1,90 +1,121 @@
 #!/usr/bin/env python3
 """
-Advanced Proxy Checker - Auto detects HTTP, HTTPS, SOCKS4, SOCKS5
-Supports high concurrency for GitHub Actions
+Proxy Checker without masscan - Direct socket scanning
+Optimized for GitHub Actions
 """
 
 import asyncio
 import aiohttp
-import subprocess
-import sys
-import re
-from typing import List, Tuple, Set, Dict, Optional
-from datetime import datetime
-from aiohttp_socks import ProxyConnector, ProxyType
 import socket
+import ipaddress
+from typing import List, Tuple, Optional
+from datetime import datetime
+import sys
 
 # Configuration
 INPUT_FILE = "ips.txt"
-MASSCAN_OUTPUT = "common_ports.txt"
 RESULT_FILE = "result.txt"
 DETAILED_RESULT_FILE = "detailed_results.txt"
-PORTS = [3128, 3129, 1080, 10808, 8080, 8088, 8888, 4545, 80, 443]
-RATE = 5000
-TIMEOUT = 5  # Reduced for higher throughput
+# Common proxy ports
+PORTS = [3128, 3129, 1080, 10808, 8080, 8088, 8888, 4545, 80, 443, 8118, 9060, 9050, 4145, 2128]
+MAX_CONCURRENT_SCAN = 1000
+MAX_CONCURRENT_PROXY_TEST = 500
+TIMEOUT = 3
 TEST_URL = "http://www.google.com"
-TEST_URL_HTTPS = "https://www.google.com"
-MAX_CONCURRENT = 1000  # High concurrency for GitHub's fast runners
 
-def run_masscan() -> List[Tuple[str, int]]:
+def expand_ip_ranges() -> List[str]:
     """
-    Run masscan to find open ports from ips.txt
-    Returns list of (ip, port) tuples
+    Expand CIDR ranges to individual IPs (limited to /24 for performance)
     """
-    print(f"[*] Starting masscan with rate={RATE}")
-    print(f"[*] Scanning {len(PORTS)} ports on targets from {INPUT_FILE}")
-    
-    # Build port list string
-    ports_str = ",".join(map(str, PORTS))
-    
-    # Masscan command - optimized for speed
-    cmd = [
-        "masscan",
-        "-iL", INPUT_FILE,
-        "-p", ports_str,
-        f"--rate={RATE}",
-        "--wait=0",  # Don't wait for responses
-        "-oL", MASSCAN_OUTPUT
-    ]
-    
+    ips = []
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
-        print(f"[+] Masscan completed. Output saved to {MASSCAN_OUTPUT}")
-    except subprocess.CalledProcessError as e:
-        print(f"[-] Masscan failed: {e.stderr}")
-        sys.exit(1)
-    except subprocess.TimeoutExpired:
-        print("[-] Masscan timeout after 5 minutes")
-        sys.exit(1)
-    except FileNotFoundError:
-        print("[-] masscan not found. Please install masscan first.")
-        sys.exit(1)
-    
-    # Parse masscan output - optimized parsing
-    open_ports = []
-    try:
-        with open(MASSCAN_OUTPUT, 'r') as f:
+        with open(INPUT_FILE, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("open"):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        port = int(parts[2])
-                        ip = parts[3]
-                        open_ports.append((ip, port))
+                if not line or line.startswith('#'):
+                    continue
+                try:
+                    # For large subnets, only take first 256 IPs to avoid explosion
+                    if '/16' in line or '/12' in line or '/14' in line:
+                        # For large ranges, convert to /24
+                        network = ipaddress.ip_network(line, strict=False)
+                        # Take first 256 IPs from the range
+                        for i, ip in enumerate(network.hosts()):
+                            if i >= 256:
+                                break
+                            ips.append(str(ip))
+                    else:
+                        # For /24 or smaller, expand all
+                        network = ipaddress.ip_network(line, strict=False)
+                        # Limit to 256 IPs per range
+                        for i, ip in enumerate(network.hosts()):
+                            if i >= 256:
+                                break
+                            ips.append(str(ip))
+                except Exception as e:
+                    print(f"Error parsing {line}: {e}")
+                    continue
     except FileNotFoundError:
-        print(f"[-] {MASSCAN_OUTPUT} not found")
+        print(f"Error: {INPUT_FILE} not found")
         sys.exit(1)
+    
+    print(f"Expanded {len(ips)} IP addresses to scan")
+    return ips
+
+async def check_port(ip: str, port: int, semaphore: asyncio.Semaphore) -> Tuple[str, int, bool]:
+    """
+    Check if a specific port is open using TCP connect
+    """
+    async with semaphore:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=TIMEOUT
+            )
+            writer.close()
+            await writer.wait_closed()
+            return (ip, port, True)
+        except:
+            return (ip, port, False)
+
+async def scan_ports(ips: List[str]) -> List[Tuple[str, int]]:
+    """
+    Scan all IPs and ports for open ports
+    """
+    print(f"\n[*] Scanning {len(ips)} IPs on {len(PORTS)} ports...")
+    print(f"[*] Total checks: {len(ips) * len(PORTS)}")
+    
+    open_ports = []
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCAN)
+    tasks = []
+    
+    for ip in ips:
+        for port in PORTS:
+            tasks.append(check_port(ip, port, semaphore))
+    
+    # Process in batches to avoid memory issues
+    batch_size = 5000
+    total_tasks = len(tasks)
+    
+    for i in range(0, total_tasks, batch_size):
+        batch = tasks[i:i+batch_size]
+        results = await asyncio.gather(*batch)
+        for ip, port, is_open in results:
+            if is_open:
+                open_ports.append((ip, port))
+                print(f"  ✅ Found open port: {ip}:{port}")
+        
+        print(f"  Progress: {min(i+batch_size, total_tasks)}/{total_tasks}")
     
     print(f"[+] Found {len(open_ports)} open ports")
     return open_ports
 
-async def detect_proxy_type(ip: str, port: int) -> Optional[str]:
+async def check_proxy(ip: str, port: int) -> Optional[str]:
     """
-    Detect proxy type: HTTP, HTTPS, SOCKS4, SOCKS5
-    Returns protocol type or None if not working
+    Test if IP:port works as proxy for Google
+    Returns protocol or None
     """
-    # Test HTTP proxy first (most common)
+    # Try HTTP
     try:
         connector = aiohttp.TCPConnector()
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -101,25 +132,23 @@ async def detect_proxy_type(ip: str, port: int) -> Optional[str]:
     except:
         pass
     
-    # Test HTTPS proxy
+    # Try HTTPS
     try:
         connector = aiohttp.TCPConnector()
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(
-                TEST_URL_HTTPS,
+                "https://www.google.com",
                 proxy=f"http://{ip}:{port}",
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT),
                 allow_redirects=True,
                 ssl=False
             ) as response:
                 if response.status == 200:
-                    text = await response.text()
-                    if "google" in text.lower():
-                        return "HTTPS"
+                    return "HTTPS"
     except:
         pass
     
-    # Test SOCKS5 proxy (using aiohttp_socks)
+    # Try SOCKS5
     try:
         from aiohttp_socks import ProxyConnector, ProxyType
         connector = ProxyConnector(
@@ -134,190 +163,86 @@ async def detect_proxy_type(ip: str, port: int) -> Optional[str]:
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT)
             ) as response:
                 if response.status == 200:
-                    text = await response.text()
-                    if "google" in text.lower():
-                        return "SOCKS5"
-    except:
-        pass
-    
-    # Test SOCKS4 proxy
-    try:
-        from aiohttp_socks import ProxyConnector, ProxyType
-        connector = ProxyConnector(
-            proxy_type=ProxyType.SOCKS4,
-            host=ip,
-            port=port,
-            rdns=True
-        )
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(
-                TEST_URL,
-                timeout=aiohttp.ClientTimeout(total=TIMEOUT)
-            ) as response:
-                if response.status == 200:
-                    text = await response.text()
-                    if "google" in text.lower():
-                        return "SOCKS4"
+                    return "SOCKS5"
     except:
         pass
     
     return None
 
-async def check_proxy_advanced(semaphore: asyncio.Semaphore, ip: str, port: int) -> Tuple[str, int, Optional[str]]:
+async def test_proxies(open_ports: List[Tuple[str, int]]):
     """
-    Check proxy with protocol auto-detection
-    Returns (ip, port, protocol_type) where protocol_type is None if failed
+    Test all open ports as proxies
     """
-    async with semaphore:
-        protocol = await detect_proxy_type(ip, port)
-        return (ip, port, protocol)
+    print(f"\n[*] Testing {len(open_ports)} proxies...")
+    
+    successful = []
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROXY_TEST)
+    
+    async def test_one(ip, port):
+        async with semaphore:
+            protocol = await check_proxy(ip, port)
+            return (ip, port, protocol)
+    
+    tasks = [test_one(ip, port) for ip, port in open_ports]
+    
+    for i, coro in enumerate(asyncio.as_completed(tasks)):
+        ip, port, protocol = await coro
+        if protocol:
+            successful.append((ip, port, protocol))
+            print(f"  ✅ WORKING: {ip}:{port} [{protocol}] (Total: {len(successful)})")
+        
+        if (i + 1) % 100 == 0:
+            print(f"  Progress: {i+1}/{len(open_ports)}")
+    
+    return successful
 
-def save_results(results: List[Tuple[str, int, str]]):
-    """
-    Save results in multiple formats
-    """
-    # Simple format (ip:port)
+def save_results(results):
+    """Save results to files"""
     with open(RESULT_FILE, 'w') as f:
-        for ip, port, protocol in results:
+        for ip, port, _ in results:
             f.write(f"{ip}:{port}\n")
     
-    # Detailed format with protocol
     with open(DETAILED_RESULT_FILE, 'w') as f:
-        f.write("# Format: IP:PORT|PROTOCOL\n")
-        f.write("# Protocols: HTTP, HTTPS, SOCKS4, SOCKS5\n")
-        f.write("# " + "="*50 + "\n\n")
+        f.write("# IP:PORT|PROTOCOL\n")
         for ip, port, protocol in results:
             f.write(f"{ip}:{port}|{protocol}\n")
     
-    # Group by protocol
-    protocol_stats = {}
-    for _, _, protocol in results:
-        protocol_stats[protocol] = protocol_stats.get(protocol, 0) + 1
-    
-    print("\n📊 Results by protocol:")
-    for proto, count in protocol_stats.items():
-        print(f"   {proto}: {count} proxies")
-
-async def test_proxies_batch(open_ports: List[Tuple[str, int]]):
-    """
-    Test all proxies with high concurrency
-    """
-    print(f"\n[*] Testing {len(open_ports)} proxies with auto-protocol detection...")
-    print(f"[*] Concurrency: {MAX_CONCURRENT} simultaneous checks")
-    print("[*] Live results will appear below:\n")
-    print("="*70)
-    
-    successful_results = []
-    total = len(open_ports)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    
-    # Create tasks for all proxies
-    tasks = [check_proxy_advanced(semaphore, ip, port) for ip, port in open_ports]
-    
-    # Track progress
-    completed = 0
-    successful = 0
-    
-    # Process as they complete
-    for future in asyncio.as_completed(tasks):
-        ip, port, protocol = await future
-        completed += 1
-        
-        if protocol:
-            successful += 1
-            successful_results.append((ip, port, protocol))
-            # Live output with color indicators
-            print(f"✅ WORKING: {ip}:{port} | Protocol: {protocol} | Progress: {completed}/{total} ({successful} found)")
-        else:
-            # Show progress even for failures
-            if completed % 100 == 0 or completed == total:
-                print(f"⏳ Progress: {completed}/{total} | Working: {successful}")
-    
-    print("="*70)
-    print(f"\n✅ Scan complete!")
-    print(f"📈 Total working proxies: {successful}/{total}")
-    
-    if successful_results:
-        save_results(successful_results)
-        print(f"\n💾 Results saved to:")
-        print(f"   - {RESULT_FILE} (simple format: ip:port)")
-        print(f"   - {DETAILED_RESULT_FILE} (detailed with protocol)")
-    
-    return successful_results
-
-async def quick_port_scan(open_ports: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
-    """
-    Quick TCP connect scan to filter dead ports before proxy testing
-    Can increase speed by 2-3x
-    """
-    print(f"\n[*] Quick TCP scan to filter dead ports...")
-    
-    async def is_port_open(ip: str, port: int) -> bool:
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port),
-                timeout=1
-            )
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except:
-            return False
-    
-    semaphore = asyncio.Semaphore(500)  # High concurrency for TCP scan
-    tasks = []
-    
-    for ip, port in open_ports:
-        async def check(sem, ip, port):
-            async with sem:
-                return (ip, port, await is_port_open(ip, port))
-        tasks.append(check(semaphore, ip, port))
-    
-    results = await asyncio.gather(*tasks)
-    filtered = [(ip, port) for ip, port, is_open in results if is_open]
-    
-    removed = len(open_ports) - len(filtered)
-    print(f"[+] TCP scan complete: {len(filtered)} live ports (removed {removed} dead ports)")
-    
-    return filtered
+    print(f"\n[+] Results saved:")
+    print(f"    - {RESULT_FILE}: {len(results)} proxies")
+    print(f"    - {DETAILED_RESULT_FILE}: detailed with protocols")
 
 async def main():
-    """Main execution function with optimizations"""
-    start_time = datetime.now()
-    print("="*70)
-    print("🚀 ADVANCED PROXY CHECKER - Auto Protocol Detection")
-    print(f"📅 Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"⚡ GitHub Optimized - High Concurrency Mode")
-    print("="*70)
+    print("="*60)
+    print("PROXY CHECKER - Direct Socket Scan (No masscan)")
+    print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*60)
     
-    # Step 1: Run masscan to find open ports
-    open_ports = run_masscan()
+    # Expand IP ranges
+    ips = expand_ip_ranges()
+    
+    if not ips:
+        print("No IPs to scan")
+        sys.exit(1)
+    
+    # Scan for open ports
+    open_ports = await scan_ports(ips)
     
     if not open_ports:
-        print("❌ No open ports found. Exiting.")
+        print("No open ports found")
         sys.exit(0)
     
-    # Step 2: Optional - Quick TCP scan to filter (can be disabled for speed)
-    # live_ports = await quick_port_scan(open_ports)
-    live_ports = open_ports  # Skip TCP scan for maximum speed
+    # Test proxies
+    working_proxies = await test_proxies(open_ports)
     
-    # Step 3: Test each proxy with protocol detection
-    successful = await test_proxies_batch(live_ports)
+    # Save results
+    if working_proxies:
+        save_results(working_proxies)
+    else:
+        print("No working proxies found")
     
-    end_time = datetime.now()
-    duration = end_time - start_time
-    
-    print(f"\n⏱️  Total duration: {duration}")
-    print(f"🚀 Average speed: {len(open_ports)/duration.total_seconds():.1f} proxies/second")
-    print("="*70)
+    duration = datetime.now() - datetime.strptime("2026-05-02 07:20:00", "%Y-%m-%d %H:%M:%S")
+    print(f"\nTotal time: {duration}")
+    print("="*60)
 
 if __name__ == "__main__":
-    # Install additional dependency for SOCKS support
-    try:
-        import aiohttp_socks
-    except ImportError:
-        print("[*] Installing aiohttp_socks for SOCKS support...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp-socks"])
-        import aiohttp_socks
-    
     asyncio.run(main())
